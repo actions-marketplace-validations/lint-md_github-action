@@ -9,13 +9,54 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import * as core from '@actions/core'
-import { Lint, CliConfig, CliLintResult } from '@lint-md/cli/lib/index'
+import { lintMarkdown, LintMdRulesConfig } from '@lint-md/core'
+import { glob } from 'glob'
+
+interface LintConfig {
+  excludeFiles?: string[]
+  rules?: LintMdRulesConfig
+  extensions?: string[]
+}
+
+interface LintResultItem {
+  loc: { start: { line: number; column: number }; end: { line: number; column: number } }
+  message: string
+  name: string
+  content: string
+  severity: number
+}
+
+interface FileLintResult {
+  path: string
+  errors: LintResultItem[]
+}
+
+async function loadMdFiles(
+  patterns: string[],
+  excludeFiles: string[],
+  extensions = ['.md', '.markdown', '.mdx']
+): Promise<string[]> {
+  const expandedPatterns = await Promise.all(
+    [...new Set(patterns)].map(async (p) => {
+      try {
+        const stat = fs.statSync(p)
+        return stat.isDirectory() ? `${p}/**/*` : p
+      } catch {
+        return p
+      }
+    })
+  )
+  const filePaths = await Promise.all(
+    expandedPatterns.map(p => glob(p, { ignore: excludeFiles, absolute: true }))
+  )
+  return [...new Set(filePaths.flat())].filter(f => extensions.some(ext => f.endsWith(ext)))
+}
 
 export class LintMdAction {
   private readonly basePath!: string
-  private readonly config: CliConfig
+  private readonly config: LintConfig
   private readonly lintFiles: string[]
-  private linter!: Lint
+  private fileResults: FileLintResult[] = []
 
   constructor(basePath?: string) {
     if (!basePath) {
@@ -24,17 +65,16 @@ export class LintMdAction {
       this.basePath = basePath
     }
     this.config = this.getConfig()
-    // 获取所有需要 lint 的目录，如果有多个需要以 ' ' 分割
     this.lintFiles = core
       .getInput('files')
       .split(' ')
       .map(res => path.resolve(this.basePath, res))
   }
 
-  getConfig(): CliConfig {
+  getConfig(): LintConfig {
     const configPath = path.resolve(this.basePath, core.getInput('configFile'))
     if (!fs.existsSync(configPath)) {
-      core.warning('The user does not have a configuration file to pass in, we will use the default configuration instead...')
+      core.info('No configuration file provided, using default rules.')
       return {}
     }
 
@@ -51,26 +91,47 @@ export class LintMdAction {
   }
 
   isPass() {
-    // 没有初始化直接调用 isPass, 返回 true
-    if (!this.linter) {
+    const allErrors = this.fileResults.flatMap(f => f.errors)
+    if (!allErrors.length) {
       return true
     }
-    const result = this.linter.countError()
-    const noErrorAndWarn = result.error === 0 && result.warning === 0
-    // 注意这里的 getInput 返回值为 string
-    return core.getInput('failOnWarnings') === 'true' ? noErrorAndWarn : result.error === 0
+    const errorCount = allErrors.filter(r => r.severity === 2).length
+    const warningCount = allErrors.filter(r => r.severity === 1).length
+    const noErrorAndWarn = errorCount === 0 && warningCount === 0
+    return core.getInput('failOnWarnings') === 'true' ? noErrorAndWarn : errorCount === 0
   }
 
   async lint() {
-    // 开始 lint
-    this.linter = new Lint(this.lintFiles, this.config)
-    await this.linter.start()
+    this.fileResults = []
+    const mdFiles = await loadMdFiles(
+      this.lintFiles,
+      this.config.excludeFiles || [],
+      this.config.extensions
+    )
+
+    if (!mdFiles.length) {
+      core.info('No markdown files to lint.')
+      return this
+    }
+
+    for (const file of mdFiles) {
+      const content = fs.readFileSync(file, 'utf-8')
+      const result = lintMarkdown(content, this.config.rules, false)
+      if (result.lintResult.length > 0) {
+        this.fileResults.push({
+          path: file,
+          errors: result.lintResult as LintResultItem[],
+        })
+      }
+    }
+
     return this
   }
 
   showResult() {
-    if (this.linter) {
-      this.linter.showResult()
+    const totalIssues = this.fileResults.reduce((sum, f) => sum + f.errors.length, 0)
+    if (totalIssues) {
+      core.info(`\nFound ${totalIssues} issue(s) in markdown files.`)
     }
     return this
   }
@@ -79,11 +140,10 @@ export class LintMdAction {
     if (this.isPass()) {
       core.info('\nMarkdown Lint free! 🎉')
     } else {
-      for (const errorFile of this.getErrors()) {
-        const filePath = path.join(errorFile.path, errorFile.file)
-        for (const error of errorFile.errors) {
-          const message = `[${error.type}] ${error.text} (${filePath}:${error.start.line}:${error.start.column})`
-          if (error.level === 'error') {
+      for (const fileResult of this.fileResults) {
+        for (const error of fileResult.errors) {
+          const message = `[${error.name}] ${error.message} (${fileResult.path}:${error.loc.start.line}:${error.loc.start.column})`
+          if (error.severity === 2) {
             core.error(message)
           } else {
             core.warning(message)
@@ -94,7 +154,7 @@ export class LintMdAction {
     }
   }
 
-  getErrors(): CliLintResult[] {
-    return this.linter.errorFiles
+  getErrors(): FileLintResult[] {
+    return this.fileResults
   }
 }
